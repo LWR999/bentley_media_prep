@@ -113,6 +113,7 @@ def process_directory(root_dir, jpeg_name):
     folders_processed = 0
     folders_with_flac = 0
     images_created = 0
+    images_skipped = 0
     
     # Walk the directory tree
     for dirpath, dirnames, filenames in os.walk(root_path):
@@ -127,6 +128,16 @@ def process_directory(root_dir, jpeg_name):
             
         folders_with_flac += 1
         current_dir = Path(dirpath)
+        output_path = current_dir / jpeg_name
+        
+        # Check if cover art already exists
+        if output_path.exists():
+            log(f"Skipping folder (cover art exists): {current_dir}")
+            log(f"  Existing file: {jpeg_name}")
+            images_skipped += 1
+            log("")
+            continue
+        
         log(f"Processing folder: {current_dir}")
         log(f"  Found {len(flac_files)} FLAC file(s)")
         
@@ -145,7 +156,6 @@ def process_directory(root_dir, jpeg_name):
         log(f"  Original cover art size: {original_size[0]}x{original_size[1]}")
         
         # Save resized image
-        output_path = current_dir / jpeg_name
         resize_and_save(image, output_path)
         images_created += 1
         folders_processed += 1
@@ -157,6 +167,7 @@ def process_directory(root_dir, jpeg_name):
     log(f"Folders scanned: {folders_with_flac}")
     log(f"Folders processed: {folders_processed}")
     log(f"Images created: {images_created}")
+    log(f"Images skipped (already existed): {images_skipped}")
 
 
 def main():
