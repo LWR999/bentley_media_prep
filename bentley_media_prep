@@ -1,37 +1,37 @@
 #!/usr/bin/env python3
 """
-bentley_media_prep - Extract and resize FLAC cover art to JPEG files
+bentley_media_prep - Resize embedded FLAC cover art and optionally create JPEG files
 
 Recursively processes directories containing FLAC files:
-- Extracts cover art from the first FLAC in each folder
-- Resizes to max 800px (longest side), maintains aspect ratio, no upscaling
-- Saves as high-quality JPEG (quality 95)
+- Resizes embedded cover art in every FLAC to a target pixel width
+- Maintains aspect ratio
+- Optionally saves a JPEG file using the same target width
 
 Special handling for personal compilations (folders starting with _):
 - Strips _ from folder name to create album name
 - Updates all FLAC files with: ALBUM=folder name, ALBUMARTIST=Various Artists, COMPILATION=1
-- Only creates cover art if it doesn't already exist
-
-Regular albums:
-- No metadata changes
-- Always creates/overwrites cover art
+- Metadata is updated whether or not JPEG export is enabled
 """
 
 import argparse
 import os
 import sys
 from datetime import datetime
-from pathlib import Path
 from io import BytesIO
+from pathlib import Path
 
 try:
-    from mutagen.flac import FLAC
+    from mutagen.flac import FLAC, Picture
     from PIL import Image
 except ImportError as e:
     print(f"ERROR: Missing required library: {e}")
     print("Please install required packages:")
     print("  pip install mutagen Pillow")
     sys.exit(1)
+
+
+JPEG_QUALITY = 95
+DEFAULT_WIDTH = 500
 
 
 def log(message):
@@ -42,275 +42,366 @@ def log(message):
 
 def update_compilation_metadata(flac_files, album_name):
     """
-    Update metadata for personal compilation tracks
-    
+    Update metadata for personal compilation tracks.
+
     Args:
         flac_files: List of Path objects pointing to FLAC files
         album_name: Album name to set for all tracks
-        
+
     Returns:
         Number of files successfully updated
     """
     updated_count = 0
-    
+
     for flac_path in flac_files:
         try:
             audio = FLAC(flac_path)
-            
+
             # Set compilation metadata
             audio['ALBUM'] = album_name
             audio['ALBUMARTIST'] = 'Various Artists'
             audio['COMPILATION'] = '1'
             # ARTIST is preserved (not modified)
-            
+
             audio.save()
             updated_count += 1
-            log(f"    Updated: {flac_path.name}")
-            
+            log(f"    Updated metadata: {flac_path.name}")
+
         except Exception as e:
-            log(f"    ERROR: Failed to update {flac_path.name}: {e}")
-    
+            log(f"    ERROR: Failed to update metadata for {flac_path.name}: {e}")
+
     return updated_count
 
 
-def extract_cover_art(flac_path):
+
+def normalize_for_jpeg(image):
+    """Convert a PIL image to RGB suitable for JPEG output."""
+    if image.mode in ('RGBA', 'LA', 'P'):
+        rgb_image = Image.new('RGB', image.size, (255, 255, 255))
+        if image.mode == 'P':
+            image = image.convert('RGBA')
+        rgb_image.paste(image, mask=image.split()[-1] if image.mode in ('RGBA', 'LA') else None)
+        return rgb_image
+
+    if image.mode != 'RGB':
+        return image.convert('RGB')
+
+    return image
+
+
+
+def resize_to_width(image, target_width):
     """
-    Extract cover art from FLAC file
-    
+    Resize image to target width while maintaining aspect ratio.
+
+    Args:
+        image: PIL Image object
+        target_width: Desired width in pixels
+
+    Returns:
+        Tuple of (resized_image, original_size, new_size)
+    """
+    width, height = image.size
+
+    if width == target_width:
+        return image, (width, height), (width, height)
+
+    new_height = max(1, round(height * (target_width / width)))
+    resized = image.resize((target_width, new_height), Image.Resampling.LANCZOS)
+    return resized, (width, height), (target_width, new_height)
+
+
+
+def resize_embedded_cover_art(flac_path, target_width):
+    """
+    Resize all embedded cover art in a FLAC file to target width.
+
     Args:
         flac_path: Path to FLAC file
-        
+        target_width: Desired width in pixels
+
     Returns:
-        PIL Image object or None if no cover art found
+        Dict containing result details
     """
     try:
         audio = FLAC(flac_path)
-        
+
         if not audio.pictures:
-            return None
-            
-        # Get the first picture (usually front cover)
-        picture = audio.pictures[0]
-        image = Image.open(BytesIO(picture.data))
-        return image
-        
+            return {
+                'status': 'no_art',
+                'count': 0,
+                'first_image': None,
+            }
+
+        resized_pictures = []
+        first_image = None
+        resized_count = 0
+
+        for index, picture in enumerate(audio.pictures):
+            image = Image.open(BytesIO(picture.data))
+            resized_image, original_size, new_size = resize_to_width(image, target_width)
+
+            buffer = BytesIO()
+            save_format = image.format or 'PNG'
+
+            if save_format.upper() == 'JPEG':
+                jpeg_image = normalize_for_jpeg(resized_image)
+                jpeg_image.save(buffer, 'JPEG', quality=JPEG_QUALITY, optimize=True)
+                picture_data = buffer.getvalue()
+                mime = 'image/jpeg'
+            else:
+                resized_image.save(buffer, save_format)
+                picture_data = buffer.getvalue()
+                mime = picture.mime or Image.MIME.get(save_format.upper(), 'image/png')
+
+            new_picture = Picture()
+            new_picture.data = picture_data
+            new_picture.type = picture.type
+            new_picture.mime = mime
+            new_picture.desc = picture.desc
+            new_picture.width = new_size[0]
+            new_picture.height = new_size[1]
+            new_picture.depth = picture.depth
+            new_picture.colors = picture.colors
+            resized_pictures.append(new_picture)
+
+            if index == 0:
+                first_image = resized_image.copy()
+                first_image.load()
+                first_original_size = original_size
+                first_new_size = new_size
+
+            resized_count += 1
+
+        audio.clear_pictures()
+        for picture in resized_pictures:
+            audio.add_picture(picture)
+        audio.save()
+
+        return {
+            'status': 'updated',
+            'count': resized_count,
+            'first_image': first_image,
+            'first_original_size': first_original_size,
+            'first_new_size': first_new_size,
+        }
+
     except Exception as e:
-        log(f"ERROR: Failed to extract cover art from {flac_path}: {e}")
-        return None
+        return {
+            'status': 'error',
+            'error': str(e),
+            'count': 0,
+            'first_image': None,
+        }
 
 
-def resize_and_save(image, output_path, max_size=800, quality=95):
+
+def save_jpeg(image, output_path, target_width, quality=JPEG_QUALITY):
     """
-    Resize image maintaining aspect ratio and save as JPEG
-    
+    Resize image to target width, maintain aspect ratio, and save as JPEG.
+
     Args:
         image: PIL Image object
         output_path: Path to save JPEG
-        max_size: Maximum dimension for longest side (default 800)
+        target_width: Desired width in pixels
         quality: JPEG quality (1-95)
     """
     try:
-        # Convert to RGB if necessary (JPEG doesn't support transparency)
-        if image.mode in ('RGBA', 'LA', 'P'):
-            rgb_image = Image.new('RGB', image.size, (255, 255, 255))
-            if image.mode == 'P':
-                image = image.convert('RGBA')
-            rgb_image.paste(image, mask=image.split()[-1] if image.mode in ('RGBA', 'LA') else None)
-            image = rgb_image
-        elif image.mode != 'RGB':
-            image = image.convert('RGB')
-        
-        # Calculate new size maintaining aspect ratio
-        width, height = image.size
-        
-        # Only resize if image is larger than max_size
-        if width <= max_size and height <= max_size:
-            # No resize needed - image is already within bounds
-            resized = image
-            log(f"  No resize needed (original size within {max_size}x{max_size})")
-        else:
-            # Calculate scaling to fit within max_size while maintaining aspect ratio
-            if width > height:
-                new_width = max_size
-                new_height = int(height * (max_size / width))
-            else:
-                new_height = max_size
-                new_width = int(width * (max_size / height))
-            
-            resized = image.resize((new_width, new_height), Image.Resampling.LANCZOS)
-            log(f"  Resized from {width}x{height} to {new_width}x{new_height}")
-        
-        # Save as JPEG
+        image = normalize_for_jpeg(image)
+        resized, original_size, new_size = resize_to_width(image, target_width)
         resized.save(output_path, 'JPEG', quality=quality, optimize=True)
-        log(f"SUCCESS: Created {output_path}")
-        
+        log(f"  JPEG written: {output_path.name} ({original_size[0]}x{original_size[1]} -> {new_size[0]}x{new_size[1]})")
+        return True
     except Exception as e:
-        log(f"ERROR: Failed to save image to {output_path}: {e}")
+        log(f"  ERROR: Failed to save image to {output_path}: {e}")
+        return False
 
 
-def process_directory(root_dir, jpeg_name):
+
+def process_directory(root_dir, target_width, create_jpg_name=None):
     """
-    Recursively process directory tree, extracting cover art from FLAC files
-    and updating metadata for personal compilations (folders starting with _)
-    
+    Recursively process directory tree, resizing embedded FLAC cover art,
+    optionally creating JPEG files, and updating metadata for personal compilations.
+
     Args:
         root_dir: Root directory to process
-        jpeg_name: Output JPEG filename
+        target_width: Desired width in pixels for embedded art and optional JPEGs
+        create_jpg_name: Optional JPEG filename. If None, no JPEG is created.
     """
     root_path = Path(root_dir).resolve()
-    
+
     if not root_path.exists():
         log(f"ERROR: Directory does not exist: {root_dir}")
         sys.exit(1)
-        
+
     if not root_path.is_dir():
         log(f"ERROR: Path is not a directory: {root_dir}")
         sys.exit(1)
-    
+
     log(f"Starting processing of: {root_path}")
-    log(f"Output filename: {jpeg_name}")
-    log(f"Target size: Max 800px (longest side), maintain aspect ratio, no upscaling")
-    log(f"Quality: 95")
+    log(f"Embedded art target width: {target_width}px")
+    if create_jpg_name:
+        log(f"JPEG export enabled: {create_jpg_name}")
+    else:
+        log("JPEG export disabled")
+    log(f"JPEG quality: {JPEG_QUALITY}")
     log("-" * 80)
-    
+
     folders_with_flac = 0
     compilations_processed = 0
-    compilations_skipped = 0
     regular_albums_processed = 0
+    metadata_files_updated = 0
+    flacs_with_art_updated = 0
+    flacs_without_art = 0
+    flac_art_errors = 0
     images_created = 0
     images_overwritten = 0
-    
-    # Walk the directory tree
+
     for dirpath, dirnames, filenames in os.walk(root_path):
-        # Skip hidden directories
         dirnames[:] = [d for d in dirnames if not d.startswith('.')]
-        
-        # Find FLAC files in current directory
-        flac_files = [f for f in filenames if f.lower().endswith('.flac')]
-        
+        flac_files = sorted(f for f in filenames if f.lower().endswith('.flac'))
+
         if not flac_files:
             continue
-            
+
         folders_with_flac += 1
         current_dir = Path(dirpath)
         folder_name = current_dir.name
-        output_path = current_dir / jpeg_name
-        
-        # Check if this is a personal compilation (starts with _)
+        output_path = current_dir / create_jpg_name if create_jpg_name else None
         is_compilation = folder_name.startswith('_')
-        
+        flac_paths = [current_dir / f for f in flac_files]
+
         if is_compilation:
-            # Personal compilation - strip _ and update metadata
-            album_name = folder_name[1:]  # Remove leading _
+            album_name = folder_name[1:]
             log(f"Processing PERSONAL COMPILATION: {current_dir}")
             log(f"  Album name: {album_name}")
-            log(f"  Found {len(flac_files)} FLAC file(s)")
-            
-            # Update metadata for all FLAC files
-            log(f"  Updating metadata for all tracks...")
-            flac_paths = [current_dir / f for f in flac_files]
-            updated = update_compilation_metadata(flac_paths, album_name)
-            log(f"  Updated {updated}/{len(flac_files)} track(s)")
-            
-            # Count as processed (we updated metadata)
             compilations_processed += 1
-            
-            # Check if cover art already exists
-            if output_path.exists():
-                log(f"  Skipping cover art extraction (file exists): {jpeg_name}")
-                compilations_skipped += 1
-                log("")
-                continue
+            metadata_files_updated += update_compilation_metadata(flac_paths, album_name)
         else:
-            # Regular album
             log(f"Processing REGULAR ALBUM: {current_dir}")
-            log(f"  Found {len(flac_files)} FLAC file(s)")
             regular_albums_processed += 1
-        
-        # Extract and save cover art
-        first_flac = current_dir / flac_files[0]
-        log(f"  Extracting cover art from: {first_flac.name}")
-        
-        # Extract cover art
-        image = extract_cover_art(first_flac)
-        
-        if image is None:
-            log(f"  WARNING: No cover art found in {first_flac.name}")
-            log("")
-            continue
-        
-        original_size = image.size
-        log(f"  Original cover art size: {original_size[0]}x{original_size[1]}")
-        
-        # Track if we're overwriting
-        overwriting = output_path.exists()
-        
-        # Save resized image
-        resize_and_save(image, output_path)
-        
-        if overwriting:
-            images_overwritten += 1
-        else:
-            images_created += 1
-        
+
+        log(f"  Found {len(flac_files)} FLAC file(s)")
+
+        first_image_for_jpeg = None
+
+        for flac_path in flac_paths:
+            result = resize_embedded_cover_art(flac_path, target_width)
+
+            if result['status'] == 'updated':
+                flacs_with_art_updated += 1
+                original = result['first_original_size']
+                new = result['first_new_size']
+                log(
+                    f"    Resized embedded art in {flac_path.name} "
+                    f"({result['count']} picture(s), {original[0]}x{original[1]} -> {new[0]}x{new[1]})"
+                )
+                if first_image_for_jpeg is None and result['first_image'] is not None:
+                    first_image_for_jpeg = result['first_image']
+            elif result['status'] == 'no_art':
+                flacs_without_art += 1
+                log(f"    No embedded art in {flac_path.name}")
+            else:
+                flac_art_errors += 1
+                log(f"    ERROR: Failed to resize embedded art in {flac_path.name}: {result['error']}")
+
+        if output_path and first_image_for_jpeg is not None:
+            overwriting = output_path.exists()
+            if save_jpeg(first_image_for_jpeg, output_path, target_width):
+                if overwriting:
+                    images_overwritten += 1
+                else:
+                    images_created += 1
+        elif output_path:
+            log(f"  WARNING: No embedded art found in this folder for JPEG export: {create_jpg_name}")
+
         log("")
-    
-    # Summary
+
     log("-" * 80)
     log("Processing complete!")
     log(f"Folders with FLAC files: {folders_with_flac}")
     log(f"Personal compilations processed: {compilations_processed}")
-    log(f"Personal compilations skipped (cover art exists): {compilations_skipped}")
     log(f"Regular albums processed: {regular_albums_processed}")
-    log(f"Images created (new): {images_created}")
-    log(f"Images overwritten (existing): {images_overwritten}")
+    log(f"Compilation metadata files updated: {metadata_files_updated}")
+    log(f"FLAC files with embedded art resized: {flacs_with_art_updated}")
+    log(f"FLAC files without embedded art: {flacs_without_art}")
+    log(f"FLAC files with art resize errors: {flac_art_errors}")
+    if create_jpg_name:
+        log(f"JPEGs created (new): {images_created}")
+        log(f"JPEGs overwritten (existing): {images_overwritten}")
+
+
+
+def positive_int(value):
+    """argparse type for positive integers."""
+    try:
+        int_value = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid integer value: {value}") from exc
+
+    if int_value <= 0:
+        raise argparse.ArgumentTypeError("width must be a positive integer")
+
+    return int_value
+
 
 
 def main():
     """Main entry point"""
     parser = argparse.ArgumentParser(
-        description="Extract and resize FLAC cover art to JPEG files with personal compilation support",
+        description="Resize embedded FLAC cover art and optionally create JPEG files with personal compilation support",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
+        epilog=f"""
 Personal Compilations (folders starting with _):
   - Strip _ from folder name to create album name
   - Update metadata: ALBUM, ALBUMARTIST=Various Artists, COMPILATION=1
-  - Only create cover art if it doesn't exist
-  
+  - Resize embedded art in every FLAC in the folder
+
 Regular Albums:
   - No metadata changes
-  - Always create/overwrite cover art
-  
+  - Resize embedded art in every FLAC in the folder
+
 Cover art processing:
-  - Resize to max 800px (longest side)
-  - Maintain aspect ratio, no upscaling
-  - JPEG quality 95
+  - Target width defaults to {DEFAULT_WIDTH}px
+  - Maintain aspect ratio
+  - JPEG export is optional
+  - JPEG quality {JPEG_QUALITY}
 
 Examples:
   bentley_media_prep /path/to/music
-  bentley_media_prep /path/to/music album_art.jpg
-  bentley_media_prep ~/Music/FLAC folder.jpg
-  
+  bentley_media_prep /path/to/music --width 800
+  bentley_media_prep /path/to/music --create-jpg
+  bentley_media_prep /path/to/music --create-jpg folder.jpg --width 1000
+
   Folder "_Road Trip 2024" becomes album "Road Trip 2024" with Various Artists
         """
     )
-    
+
     parser.add_argument(
         'directory',
         help='Root directory to process (will recurse through all subdirectories)'
     )
-    
+
     parser.add_argument(
-        'jpeg_name',
-        nargs='?',
-        default='cover.jpg',
-        help='Output JPEG filename (default: cover.jpg)'
+        '--width', '-w',
+        type=positive_int,
+        default=DEFAULT_WIDTH,
+        help=f'Target pixel width for embedded art and optional JPEG export (default: {DEFAULT_WIDTH})'
     )
-    
+
+    parser.add_argument(
+        '--create-jpg',
+        nargs='?',
+        const='cover.jpg',
+        default=None,
+        metavar='JPEG_NAME',
+        help='Optionally create a JPEG file per folder. Default filename is cover.jpg when flag is present.'
+    )
+
     args = parser.parse_args()
-    
+
     try:
-        process_directory(args.directory, args.jpeg_name)
+        process_directory(args.directory, args.width, args.create_jpg)
     except KeyboardInterrupt:
         log("\nINTERRUPTED: Processing cancelled by user")
         sys.exit(130)
